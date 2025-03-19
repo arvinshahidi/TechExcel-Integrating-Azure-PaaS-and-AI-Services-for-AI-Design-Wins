@@ -8,6 +8,9 @@ using Microsoft.Data.SqlClient;
 using Azure.AI.OpenAI;
 using Azure;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.SemanticKernel;
+using Microsoft.SemanticKernel.Connectors.OpenAI;
+using Microsoft.SemanticKernel.ChatCompletion;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -45,15 +48,15 @@ builder.Services.AddSingleton<CosmosClient>((_) =>
     return client;
 });
 
-// Create a single instance of the AzureOpenAIClient to be shared across the application.
-builder.Services.AddSingleton<AzureOpenAIClient>((_) =>
-{
-    var endpoint = new Uri(builder.Configuration["AzureOpenAI:Endpoint"]!);
-    var credentials = new AzureKeyCredential(builder.Configuration["AzureOpenAI:ApiKey"]!);
+// // Create a single instance of the AzureOpenAIClient to be shared across the application.
+// builder.Services.AddSingleton<AzureOpenAIClient>((_) =>
+// {
+//     var endpoint = new Uri(builder.Configuration["AzureOpenAI:Endpoint"]!);
+//     var credentials = new AzureKeyCredential(builder.Configuration["AzureOpenAI:ApiKey"]!);
 
-    var client = new AzureOpenAIClient(endpoint, credentials);
-    return client;
-});
+//     var client = new AzureOpenAIClient(endpoint, credentials);
+//     return client;
+// });
 
 var app = builder.Build();
 
@@ -65,6 +68,12 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+
+
+var config = new ConfigurationBuilder()
+    .AddUserSecrets<Program>()
+    .AddEnvironmentVariables()
+    .Build();
 
 /**** Endpoints ****/
 // This endpoint serves as the default landing page for the API.
@@ -78,7 +87,8 @@ app.MapGet("/", async () =>
 // Retrieve the set of hotels from the database.
 app.MapGet("/Hotels", async () => 
 {
-    throw new NotImplementedException();
+    var hotels = await app.Services.GetRequiredService<IDatabaseService>().GetHotels();
+    return hotels;
 })
     .WithName("GetHotels")
     .WithOpenApi();
@@ -86,7 +96,8 @@ app.MapGet("/Hotels", async () =>
 // Retrieve the bookings for a specific hotel.
 app.MapGet("/Hotels/{hotelId}/Bookings/", async (int hotelId) => 
 {
-    throw new NotImplementedException();
+    var bookings = await app.Services.GetRequiredService<IDatabaseService>().GetBookingsForHotel(hotelId);
+    return bookings;
 })
     .WithName("GetBookingsForHotel")
     .WithOpenApi();
@@ -94,11 +105,11 @@ app.MapGet("/Hotels/{hotelId}/Bookings/", async (int hotelId) =>
 // Retrieve the bookings for a specific hotel that are after a specified date.
 app.MapGet("/Hotels/{hotelId}/Bookings/{min_date}", async (int hotelId, DateTime min_date) => 
 {
-    throw new NotImplementedException();
+    var bookings = await app.Services.GetRequiredService<IDatabaseService>().GetBookingsByHotelAndMinimumDate(hotelId, min_date);
+    return bookings;
 })
     .WithName("GetRecentBookingsForHotel")
     .WithOpenApi();
-
 // This endpoint is used to send a message to the Azure OpenAI endpoint.
 app.MapPost("/Chat", async Task<string> (HttpRequest request) =>
 {
@@ -123,7 +134,10 @@ app.MapGet("/Vectorize", async (string text, [FromServices] IVectorizationServic
 app.MapPost("/VectorSearch", async ([FromBody] float[] queryVector, [FromServices] IVectorizationService vectorizationService, int max_results = 0, double minimum_similarity_score = 0.8) =>
 {
     // Exercise 3 Task 3 TODO #3: Insert code to call the ExecuteVectorSearch function on the Vectorization Service. Don't forget to remove the NotImplementedException.
-    throw new NotImplementedException();
+    
+    var results = await vectorizationService.ExecuteVectorSearch(queryVector, max_results, minimum_similarity_score);
+    return results;
+    
 })
     .WithName("VectorSearch")
     .WithOpenApi();
@@ -138,3 +152,42 @@ app.MapPost("/MaintenanceCopilotChat", async ([FromBody]string message, [FromSer
     .WithOpenApi();
 
 app.Run();
+
+
+builder.Services.AddSingleton<Kernel>((_) =>
+{
+    IKernelBuilder kernelBuilder = Kernel.CreateBuilder();
+    kernelBuilder.AddAzureOpenAIChatCompletion(
+        deploymentName: builder.Configuration["AzureOpenAI:DeploymentName"]!,
+        endpoint: builder.Configuration["AzureOpenAI:Endpoint"]!,
+        apiKey: builder.Configuration["AzureOpenAI:ApiKey"]!
+    );
+
+    #pragma warning disable SKEXP0010 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
+    kernelBuilder.AddAzureOpenAITextEmbeddingGeneration(
+    deploymentName: builder.Configuration["AzureOpenAI:EmbeddingDeploymentName"]!,
+    endpoint: builder.Configuration["AzureOpenAI:Endpoint"]!,
+    apiKey: builder.Configuration["AzureOpenAI:ApiKey"]!
+    );
+    #pragma warning restore SKEXP0010 // Type is for evaluation purposes o
+
+    var databaseService = _.GetRequiredService<IDatabaseService>();
+    kernelBuilder.Plugins.AddFromObject(databaseService);
+    return kernelBuilder.Build();
+});
+
+
+app.MapPost("/Chat", async Task<string> (HttpRequest request) =>
+{
+    var message = await Task.FromResult(request.Form["message"]);
+    var kernel = app.Services.GetRequiredService<Kernel>();
+    var chatCompletionService = kernel.GetRequiredService<IChatCompletionService>();
+    var executionSettings = new OpenAIPromptExecutionSettings
+    {
+        ToolCallBehavior = ToolCallBehavior.AutoInvokeKernelFunctions
+    };
+    var response = await chatCompletionService.GetChatMessageContentAsync(message.ToString(), executionSettings, kernel);
+    return response?.Content!;
+})
+    .WithName("Chat")
+    .WithOpenApi();
